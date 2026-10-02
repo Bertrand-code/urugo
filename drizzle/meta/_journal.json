@@ -15,6 +15,13 @@
       "when": 1790899523980,
       "tag": "0001_absurd_rawhide_kid",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790901263451,
+      "tag": "0002_clean_the_anarchist",
+      "breakpoints": true
     }
   ]
 }

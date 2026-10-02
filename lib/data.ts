@@ -11,6 +11,7 @@ export type Account = {
 
 type RuntimeEnv = {
   DB?: D1Database;
+  MEDIA?: R2Bucket;
   ADMIN_EMAIL?: string;
   RESEND_API_KEY?: string;
   CONTACT_FROM_EMAIL?: string;
@@ -37,6 +38,17 @@ const schemaStatements = [
     occupied INTEGER NOT NULL DEFAULT 0 CHECK(occupied >= 0),
     status TEXT NOT NULL CHECK(status IN ('published', 'draft')) DEFAULT 'draft',
     accent TEXT NOT NULL DEFAULT 'green',
+    listing_type TEXT NOT NULL DEFAULT 'rent',
+    price_amount INTEGER NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'BIF',
+    bedrooms INTEGER NOT NULL DEFAULT 0,
+    bathrooms REAL NOT NULL DEFAULT 0,
+    area_sqm INTEGER,
+    year_built INTEGER,
+    address TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT 'Bujumbura',
+    description TEXT NOT NULL DEFAULT '',
+    featured INTEGER NOT NULL DEFAULT 0,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -93,23 +105,111 @@ const schemaStatements = [
     status TEXT NOT NULL CHECK(status IN ('new', 'read', 'closed')) DEFAULT 'new',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
+  `CREATE TABLE IF NOT EXISTS property_images (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    storage_key TEXT NOT NULL UNIQUE,
+    alt_text TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS units (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    bedrooms INTEGER NOT NULL DEFAULT 0,
+    bathrooms REAL NOT NULL DEFAULT 0,
+    area_sqm INTEGER,
+    price_amount INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'BIF',
+    status TEXT NOT NULL CHECK(status IN ('available', 'occupied', 'reserved')) DEFAULT 'available',
+    available_date TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS leases (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    unit_id TEXT,
+    resident_account_id TEXT,
+    resident_email TEXT NOT NULL,
+    resident_name TEXT NOT NULL,
+    monthly_rent INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'BIF',
+    due_day INTEGER NOT NULL DEFAULT 5,
+    start_date TEXT NOT NULL,
+    end_date TEXT,
+    status TEXT NOT NULL CHECK(status IN ('active', 'pending', 'ended')) DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS charges (
+    id TEXT PRIMARY KEY,
+    lease_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('rent', 'utility', 'fee')) DEFAULT 'rent',
+    description TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    due_date TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('open', 'paid', 'waived')) DEFAULT 'open',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS payments (
+    id TEXT PRIMARY KEY,
+    lease_id TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    method TEXT NOT NULL DEFAULT 'manual',
+    reference TEXT NOT NULL DEFAULT '',
+    paid_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
   "CREATE INDEX IF NOT EXISTS idx_properties_status ON properties(status)",
   "CREATE INDEX IF NOT EXISTS idx_property_memberships_account ON property_memberships(account_id, property_id)",
   "CREATE INDEX IF NOT EXISTS idx_applications_property_created ON applications(property_id, created_at DESC)",
   "CREATE INDEX IF NOT EXISTS idx_contact_inquiries_created ON contact_inquiries(created_at DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_property_images_property_sort ON property_images(property_id, sort_order)",
+  "CREATE INDEX IF NOT EXISTS idx_units_property_status ON units(property_id, status)",
+  "CREATE INDEX IF NOT EXISTS idx_leases_resident_email_status ON leases(resident_email, status)",
+  "CREATE INDEX IF NOT EXISTS idx_leases_property_status ON leases(property_id, status)",
+  "CREATE INDEX IF NOT EXISTS idx_charges_lease_status_due ON charges(lease_id, status, due_date)",
+  "CREATE INDEX IF NOT EXISTS idx_payments_lease_paid ON payments(lease_id, paid_at)",
 ];
+
+const propertyColumnMigrations: Record<string, string> = {
+  listing_type: "ALTER TABLE properties ADD COLUMN listing_type TEXT NOT NULL DEFAULT 'rent'",
+  price_amount: "ALTER TABLE properties ADD COLUMN price_amount INTEGER NOT NULL DEFAULT 0",
+  currency: "ALTER TABLE properties ADD COLUMN currency TEXT NOT NULL DEFAULT 'BIF'",
+  bedrooms: "ALTER TABLE properties ADD COLUMN bedrooms INTEGER NOT NULL DEFAULT 0",
+  bathrooms: "ALTER TABLE properties ADD COLUMN bathrooms REAL NOT NULL DEFAULT 0",
+  area_sqm: "ALTER TABLE properties ADD COLUMN area_sqm INTEGER",
+  year_built: "ALTER TABLE properties ADD COLUMN year_built INTEGER",
+  address: "ALTER TABLE properties ADD COLUMN address TEXT NOT NULL DEFAULT ''",
+  city: "ALTER TABLE properties ADD COLUMN city TEXT NOT NULL DEFAULT 'Bujumbura'",
+  description: "ALTER TABLE properties ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+  featured: "ALTER TABLE properties ADD COLUMN featured INTEGER NOT NULL DEFAULT 0",
+};
 
 export function runtimeEnv(): RuntimeEnv {
   return env as unknown as RuntimeEnv;
+}
+
+export function mediaBucket() {
+  return runtimeEnv().MEDIA;
+}
+
+async function initializeSchema(db: D1Database) {
+  await db.batch(schemaStatements.map((statement) => db.prepare(statement)));
+  const columns = await db.prepare("PRAGMA table_info(properties)").all<{ name: string }>();
+  const existing = new Set(columns.results.map((column) => column.name));
+  const migrations = Object.entries(propertyColumnMigrations)
+    .filter(([column]) => !existing.has(column))
+    .map(([, statement]) => db.prepare(statement));
+  if (migrations.length) await db.batch(migrations);
+  await db.prepare("PRAGMA optimize").run();
 }
 
 export async function database(): Promise<D1Database> {
   const db = runtimeEnv().DB;
   if (!db) throw new Error("The workspace database is unavailable.");
   if (!schemaReady) {
-    schemaReady = db.batch(schemaStatements.map((statement) => db.prepare(statement)))
-      .then(() => db.prepare("PRAGMA optimize").run())
-      .then(() => undefined);
+    schemaReady = initializeSchema(db).then(() => undefined);
   }
   await schemaReady;
   return db;
@@ -133,6 +233,8 @@ function isLocalDevelopment() {
 }
 
 async function claimGroupAccess(db: D1Database, account: Account): Promise<Account> {
+  await db.prepare("UPDATE leases SET resident_account_id = ? WHERE resident_email = ? AND resident_account_id IS NULL")
+    .bind(account.id, account.email).run();
   const invitations = await db.prepare(
     `SELECT i.id AS invite_id, g.id AS group_id, g.property_id, g.role
      FROM access_invites i

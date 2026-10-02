@@ -21,7 +21,9 @@ export default function ApplyPage() {
     fetch("/api/properties?public=1").then((response) => response.json()).then((result) => {
       const available = (result.properties ?? []).filter((property: Property) => property.homes > property.occupied);
       setProperties(available);
-      if (available[0]) setPropertyId(available[0].id);
+      const requested = new URLSearchParams(window.location.search).get("listing");
+      if (requested && available.some((property: Property) => property.id === requested)) setPropertyId(requested);
+      else if (available[0]) setPropertyId(available[0].id);
     }).catch(() => setError("We could not load available properties. Please try again."));
   }, []);
 

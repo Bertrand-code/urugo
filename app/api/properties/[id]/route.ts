@@ -1,4 +1,4 @@
-import { database, errorResponse, requirePropertyManager, stringField } from "@/lib/data";
+import { database, errorResponse, mediaBucket, requirePropertyManager, stringField } from "@/lib/data";
 
 export const dynamic = "force-dynamic";
 
@@ -41,10 +41,21 @@ export async function DELETE(_request: Request, { params }: { params: Promise<{ 
     if (!property) return Response.json({ error: "Property not found." }, { status: 404 });
 
     const groups = await db.prepare("SELECT id FROM access_groups WHERE property_id = ?").bind(propertyId).all<{ id: string }>();
+    const imageRows = await db.prepare("SELECT storage_key FROM property_images WHERE property_id = ?").bind(propertyId).all<{ storage_key: string }>();
+    const leaseRows = await db.prepare("SELECT id FROM leases WHERE property_id = ?").bind(propertyId).all<{ id: string }>();
     const statements: D1PreparedStatement[] = [
       db.prepare("DELETE FROM applications WHERE property_id = ?").bind(propertyId),
       db.prepare("DELETE FROM property_memberships WHERE property_id = ?").bind(propertyId),
+      db.prepare("DELETE FROM property_images WHERE property_id = ?").bind(propertyId),
+      db.prepare("DELETE FROM units WHERE property_id = ?").bind(propertyId),
+      db.prepare("DELETE FROM leases WHERE property_id = ?").bind(propertyId),
     ];
+    for (const lease of leaseRows.results) {
+      statements.push(
+        db.prepare("DELETE FROM charges WHERE lease_id = ?").bind(lease.id),
+        db.prepare("DELETE FROM payments WHERE lease_id = ?").bind(lease.id),
+      );
+    }
     for (const group of groups.results) {
       statements.push(
         db.prepare("DELETE FROM access_group_members WHERE group_id = ?").bind(group.id),
@@ -56,6 +67,8 @@ export async function DELETE(_request: Request, { params }: { params: Promise<{ 
       db.prepare("DELETE FROM properties WHERE id = ?").bind(propertyId),
     );
     await db.batch(statements);
+    const bucket = mediaBucket();
+    if (bucket && imageRows.results.length) await bucket.delete(imageRows.results.map((image) => image.storage_key));
     return new Response(null, { status: 204 });
   } catch (error) {
     return errorResponse(error);
