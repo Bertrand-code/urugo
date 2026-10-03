@@ -8,13 +8,7 @@ import globals from "globals";
 import tseslint from "typescript-eslint";
 
 const eslintConfig = defineConfig([
-  globalIgnores([
-    ".next/**",
-    "dist/**",
-    "out/**",
-    "build/**",
-    "next-env.d.ts",
-  ]),
+  globalIgnores([".next/**", "dist/**", "out/**", "build/**", "next-env.d.ts"]),
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   react.configs.flat.recommended,
@@ -23,6 +17,14 @@ const eslintConfig = defineConfig([
   jsxA11y.flatConfigs.recommended,
   next.configs["core-web-vitals"],
   {
+    rules: {
+      // Vinext uses the Next-compatible app directory but keeps native anchor
+      // navigation for public links. These are valid same-origin links here.
+      "@next/next/no-html-link-for-pages": "off",
+      // Async data hydration is deliberately initiated after first render.
+      "react-hooks/set-state-in-effect": "off",
+      "jsx-a11y/label-has-associated-control": ["error", { depth: 5 }],
+    },
     languageOptions: {
       globals: {
         ...globals.browser,

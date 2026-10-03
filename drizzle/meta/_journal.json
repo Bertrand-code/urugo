@@ -22,6 +22,48 @@
       "when": 1790901263451,
       "tag": "0002_clean_the_anarchist",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1790902722793,
+      "tag": "0003_short_nuke",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1790917195488,
+      "tag": "0004_certain_talon",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1790918314153,
+      "tag": "0005_blue_sunspot",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1790918886943,
+      "tag": "0006_skinny_mentor",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1790919223350,
+      "tag": "0007_lovely_black_queen",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1790995622339,
+      "tag": "0008_complex_franklin_storm",
+      "breakpoints": true
     }
   ]
 }

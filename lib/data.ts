@@ -1,5 +1,7 @@
 import { env } from "cloudflare:workers";
 import { headers } from "next/headers";
+import { initializeDomain } from "./domain-schema";
+import { initializeProducts } from "./product-schema";
 
 export type Role = "admin" | "owner" | "resident";
 export type Account = {
@@ -160,6 +162,42 @@ const schemaStatements = [
     paid_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
+  `CREATE TABLE IF NOT EXISTS maintenance_requests (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    lease_id TEXT,
+    resident_account_id TEXT,
+    resident_name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'general',
+    priority TEXT NOT NULL CHECK(priority IN ('low', 'normal', 'high', 'emergency')) DEFAULT 'normal',
+    status TEXT NOT NULL CHECK(status IN ('new', 'in_progress', 'on_hold', 'completed')) DEFAULT 'new',
+    scheduled_for TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS property_messages (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    sender_account_id TEXT NOT NULL,
+    sender_name TEXT NOT NULL,
+    audience TEXT NOT NULL CHECK(audience IN ('all', 'resident', 'management')) DEFAULT 'all',
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS property_documents (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    lease_id TEXT,
+    uploaded_by TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    storage_key TEXT NOT NULL UNIQUE,
+    content_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    visibility TEXT NOT NULL CHECK(visibility IN ('management', 'resident')) DEFAULT 'resident',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
   "CREATE INDEX IF NOT EXISTS idx_properties_status ON properties(status)",
   "CREATE INDEX IF NOT EXISTS idx_property_memberships_account ON property_memberships(account_id, property_id)",
   "CREATE INDEX IF NOT EXISTS idx_applications_property_created ON applications(property_id, created_at DESC)",
@@ -170,20 +208,32 @@ const schemaStatements = [
   "CREATE INDEX IF NOT EXISTS idx_leases_property_status ON leases(property_id, status)",
   "CREATE INDEX IF NOT EXISTS idx_charges_lease_status_due ON charges(lease_id, status, due_date)",
   "CREATE INDEX IF NOT EXISTS idx_payments_lease_paid ON payments(lease_id, paid_at)",
+  "CREATE INDEX IF NOT EXISTS idx_maintenance_property_status_created ON maintenance_requests(property_id, status, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_maintenance_resident_created ON maintenance_requests(resident_account_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_messages_property_created ON property_messages(property_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_documents_property_created ON property_documents(property_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_documents_lease_created ON property_documents(lease_id, created_at)",
 ];
 
 const propertyColumnMigrations: Record<string, string> = {
-  listing_type: "ALTER TABLE properties ADD COLUMN listing_type TEXT NOT NULL DEFAULT 'rent'",
-  price_amount: "ALTER TABLE properties ADD COLUMN price_amount INTEGER NOT NULL DEFAULT 0",
-  currency: "ALTER TABLE properties ADD COLUMN currency TEXT NOT NULL DEFAULT 'BIF'",
-  bedrooms: "ALTER TABLE properties ADD COLUMN bedrooms INTEGER NOT NULL DEFAULT 0",
-  bathrooms: "ALTER TABLE properties ADD COLUMN bathrooms REAL NOT NULL DEFAULT 0",
+  listing_type:
+    "ALTER TABLE properties ADD COLUMN listing_type TEXT NOT NULL DEFAULT 'rent'",
+  price_amount:
+    "ALTER TABLE properties ADD COLUMN price_amount INTEGER NOT NULL DEFAULT 0",
+  currency:
+    "ALTER TABLE properties ADD COLUMN currency TEXT NOT NULL DEFAULT 'BIF'",
+  bedrooms:
+    "ALTER TABLE properties ADD COLUMN bedrooms INTEGER NOT NULL DEFAULT 0",
+  bathrooms:
+    "ALTER TABLE properties ADD COLUMN bathrooms REAL NOT NULL DEFAULT 0",
   area_sqm: "ALTER TABLE properties ADD COLUMN area_sqm INTEGER",
   year_built: "ALTER TABLE properties ADD COLUMN year_built INTEGER",
   address: "ALTER TABLE properties ADD COLUMN address TEXT NOT NULL DEFAULT ''",
   city: "ALTER TABLE properties ADD COLUMN city TEXT NOT NULL DEFAULT 'Bujumbura'",
-  description: "ALTER TABLE properties ADD COLUMN description TEXT NOT NULL DEFAULT ''",
-  featured: "ALTER TABLE properties ADD COLUMN featured INTEGER NOT NULL DEFAULT 0",
+  description:
+    "ALTER TABLE properties ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+  featured:
+    "ALTER TABLE properties ADD COLUMN featured INTEGER NOT NULL DEFAULT 0",
 };
 
 export function runtimeEnv(): RuntimeEnv {
@@ -196,12 +246,16 @@ export function mediaBucket() {
 
 async function initializeSchema(db: D1Database) {
   await db.batch(schemaStatements.map((statement) => db.prepare(statement)));
-  const columns = await db.prepare("PRAGMA table_info(properties)").all<{ name: string }>();
+  const columns = await db
+    .prepare("PRAGMA table_info(properties)")
+    .all<{ name: string }>();
   const existing = new Set(columns.results.map((column) => column.name));
   const migrations = Object.entries(propertyColumnMigrations)
     .filter(([column]) => !existing.has(column))
     .map(([, statement]) => db.prepare(statement));
   if (migrations.length) await db.batch(migrations);
+  await initializeDomain(db);
+  await initializeProducts(db);
   await db.prepare("PRAGMA optimize").run();
 }
 
@@ -232,55 +286,70 @@ function isLocalDevelopment() {
   return process.env.NODE_ENV === "development";
 }
 
-async function claimGroupAccess(db: D1Database, account: Account): Promise<Account> {
-  await db.prepare("UPDATE leases SET resident_account_id = ? WHERE resident_email = ? AND resident_account_id IS NULL")
-    .bind(account.id, account.email).run();
-  const invitations = await db.prepare(
-    `SELECT i.id AS invite_id, g.id AS group_id, g.property_id, g.role
-     FROM access_invites i
-     INNER JOIN access_groups g ON g.id = i.group_id
-     WHERE i.email = ?`,
-  ).bind(account.email).all<{ invite_id: string; group_id: string; property_id: string; role: Exclude<Role, "admin"> }>();
-
-  if (!invitations.results.length) return account;
-
-  const statements: D1PreparedStatement[] = [];
-  for (const invite of invitations.results) {
-    statements.push(
-      db.prepare("INSERT OR IGNORE INTO access_group_members (id, group_id, account_id) VALUES (?, ?, ?)")
-        .bind(crypto.randomUUID(), invite.group_id, account.id),
-      db.prepare("INSERT OR IGNORE INTO property_memberships (id, property_id, account_id, role) VALUES (?, ?, ?, ?)")
-        .bind(crypto.randomUUID(), invite.property_id, account.id, invite.role),
-      db.prepare("DELETE FROM access_invites WHERE id = ?").bind(invite.invite_id),
-    );
-  }
-  if (account.role !== "admin") {
-    const strongestRole = invitations.results.some((invite) => invite.role === "owner") ? "owner" : "resident";
-    statements.push(db.prepare("UPDATE accounts SET role = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(strongestRole, account.id));
-  }
-  await db.batch(statements);
-  return (await db.prepare("SELECT id, email, display_name, role FROM accounts WHERE id = ?").bind(account.id).first<Account>())!;
+async function claimGroupAccess(
+  db: D1Database,
+  account: Account,
+): Promise<Account> {
+  await db
+    .prepare(
+      "UPDATE leases SET resident_account_id = ? WHERE resident_email = ? AND resident_account_id IS NULL",
+    )
+    .bind(account.id, account.email)
+    .run();
+  await db
+    .prepare(
+      "UPDATE household_members SET account_id = ? WHERE email = ? AND account_id IS NULL",
+    )
+    .bind(account.id, account.email)
+    .run();
+  // Invitations now require explicit acceptance. Legacy groups remain archival.
+  return account;
 }
 
-async function ensureAccount(input: { id: string; email: string; displayName: string }): Promise<Account> {
+async function ensureAccount(input: {
+  id: string;
+  email: string;
+  displayName: string;
+}): Promise<Account> {
   const db = await database();
   const email = normalizeEmail(input.email);
-  const preferredAdmin = normalizeEmail(runtimeEnv().ADMIN_EMAIL ?? PRIMARY_ADMIN_EMAIL);
-  const existing = await db.prepare("SELECT id, email, display_name, role FROM accounts WHERE id = ?").bind(input.id).first<Account>();
+  const preferredAdmin = normalizeEmail(
+    runtimeEnv().ADMIN_EMAIL ?? PRIMARY_ADMIN_EMAIL,
+  );
+  const existing = await db
+    .prepare("SELECT id, email, display_name, role FROM accounts WHERE id = ?")
+    .bind(input.id)
+    .first<Account>();
 
   if (existing) {
-    if (existing.email !== email || existing.display_name !== input.displayName) {
-      await db.prepare("UPDATE accounts SET email = ?, display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(email, input.displayName, input.id).run();
+    if (
+      existing.email !== email ||
+      existing.display_name !== input.displayName
+    ) {
+      await db
+        .prepare(
+          "UPDATE accounts SET email = ?, display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(email, input.displayName, input.id)
+        .run();
     }
     const refreshed = { ...existing, email, display_name: input.displayName };
     return claimGroupAccess(db, refreshed);
   }
 
   const role: Role = email === preferredAdmin ? "admin" : "resident";
-  await db.prepare("INSERT INTO accounts (id, email, display_name, role) VALUES (?, ?, ?, ?)")
-    .bind(input.id, email, input.displayName, role).run();
-  return claimGroupAccess(db, { id: input.id, email, display_name: input.displayName, role });
+  await db
+    .prepare(
+      "INSERT INTO accounts (id, email, display_name, role) VALUES (?, ?, ?, ?)",
+    )
+    .bind(input.id, email, input.displayName, role)
+    .run();
+  return claimGroupAccess(db, {
+    id: input.id,
+    email,
+    display_name: input.displayName,
+    role,
+  });
 }
 
 export async function currentAccount(): Promise<Account | null> {
@@ -288,13 +357,23 @@ export async function currentAccount(): Promise<Account | null> {
   const id = requestHeaders.get("oai-authenticated-user-id");
   const email = requestHeaders.get("oai-authenticated-user-email");
   const encodedName = requestHeaders.get("oai-authenticated-user-full-name");
-  const isEncoded = requestHeaders.get("oai-authenticated-user-full-name-encoding") === "percent-encoded-utf-8";
+  const isEncoded =
+    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
+    "percent-encoded-utf-8";
 
   if (id && email) {
-    return ensureAccount({ id, email, displayName: safeDisplayName(isEncoded ? encodedName : null, email) });
+    return ensureAccount({
+      id,
+      email,
+      displayName: safeDisplayName(isEncoded ? encodedName : null, email),
+    });
   }
   if (isLocalDevelopment()) {
-    return ensureAccount({ id: "local-administrator", email: PRIMARY_ADMIN_EMAIL, displayName: "Workspace administrator" });
+    return ensureAccount({
+      id: "local-administrator",
+      email: PRIMARY_ADMIN_EMAIL,
+      displayName: "Workspace administrator",
+    });
   }
   return null;
 }
@@ -307,43 +386,82 @@ export async function requireAccount(): Promise<Account> {
 
 export async function requireAdmin(): Promise<Account> {
   const account = await requireAccount();
-  if (account.role !== "admin") throw new AccessError("Only administrators can manage workspace access.", 403);
+  if (account.role !== "admin")
+    throw new AccessError(
+      "Only administrators can manage workspace access.",
+      403,
+    );
   return account;
 }
 
-export async function propertyAccess(account: Account, propertyId: string): Promise<"admin" | "owner" | "resident" | null> {
-  if (account.role === "admin") return "admin";
-  const db = await database();
-  const membership = await db.prepare("SELECT role FROM property_memberships WHERE property_id = ? AND account_id = ?")
-    .bind(propertyId, account.id).first<{ role: "owner" | "resident" }>();
-  return membership?.role ?? null;
+export async function propertyAccess(
+  account: Account,
+  propertyId: string,
+): Promise<"admin" | "owner" | "resident" | null> {
+  const { can } = await import("./authorization");
+  if (await can(account, "property.edit", propertyId))
+    return account.role === "admin" ? "admin" : "owner";
+  return null;
 }
-
-export async function requirePropertyManager(propertyId: string): Promise<Account> {
-  const account = await requireAccount();
+export async function requirePropertyManager(
+  propertyId: string,
+): Promise<Account> {
+  const { requirePermission } = await import("./authorization");
+  return requirePermission(propertyId, "property.edit");
+}
+export async function propertyParticipant(
+  account: Account,
+  propertyId: string,
+): Promise<"admin" | "owner" | "resident" | null> {
   const access = await propertyAccess(account, propertyId);
-  if (access !== "admin" && access !== "owner") throw new AccessError("You do not have permission to manage this property.", 403);
-  return account;
-}
-
-export async function accessiblePropertyIds(account: Account): Promise<string[] | null> {
-  if (account.role === "admin") return null;
+  if (access) return access;
   const db = await database();
-  const rows = await db.prepare("SELECT property_id FROM property_memberships WHERE account_id = ?")
-    .bind(account.id).all<{ property_id: string }>();
-  return rows.results.map((row) => row.property_id);
+  const household = await db
+    .prepare(
+      "SELECT t.id FROM tenancies t JOIN household_members h ON h.tenancy_id=t.id WHERE t.property_id=? AND h.account_id=? AND h.relationship IN ('primary','co_resident','guarantor') AND t.status IN ('active','notice_given','move_out_pending') LIMIT 1",
+    )
+    .bind(propertyId, account.id)
+    .first();
+  return household ? "resident" : null;
+}
+export async function requirePropertyParticipant(
+  propertyId: string,
+): Promise<{ account: Account; access: "admin" | "owner" | "resident" }> {
+  const account = await requireAccount();
+  const access = await propertyParticipant(account, propertyId);
+  if (!access)
+    throw new AccessError("You do not have access to this property.", 403);
+  return { account, access };
+}
+export async function accessiblePropertyIds(
+  account: Account,
+): Promise<string[] | null> {
+  const { permittedPropertyIds } = await import("./authorization");
+  return permittedPropertyIds(account, "property.view");
 }
 
 export class AccessError extends Error {
-  constructor(message: string, public status: number) {
+  constructor(
+    message: string,
+    public status: number,
+  ) {
     super(message);
   }
 }
 
 export function errorResponse(error: unknown) {
-  if (error instanceof AccessError) return Response.json({ error: error.message }, { status: error.status });
+  if (error instanceof SyntaxError)
+    return Response.json(
+      { error: "Please send a valid request." },
+      { status: 400 },
+    );
+  if (error instanceof AccessError)
+    return Response.json({ error: error.message }, { status: error.status });
   console.error(error);
-  return Response.json({ error: "Something went wrong. Please try again." }, { status: 500 });
+  return Response.json(
+    { error: "Something went wrong. Please try again." },
+    { status: 500 },
+  );
 }
 
 export function stringField(value: unknown, maxLength = 200) {

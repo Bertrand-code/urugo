@@ -1,50 +1,60 @@
 # Urugo
 
-Urugo is a property-operations workspace for property managers, owners, and residents in Burundi.
+Urugo combines public property discovery, account-owned applications, resident services, and property-scoped management. This is a local review build; see [the refactor report](PRODUCT-REFACTOR.md) for implemented workflows, test results, migration details, and remaining production launch requirements.
 
-## What it includes
+## Local review
 
-- A public home marketplace at /discover, with rental and sale listings
-- Listing detail pages with location, pricing, property facts, photos, and available units
-- Property creation with owner assignment, address, price, sale/rental intent, specs, descriptions, and photo uploads
-- A public rental application form and owner review queue
-- Unit records with their own price and availability
-- Resident leases, first rent charges, payment history, and an amount-due portal
-- Per-property access groups for property owners and residents
-- Administrator-only property deletion and access management
-- A public contact form with a private inquiry queue
+```sh
+npm install
+npm run dev -- --port 3000
+```
 
-## Roles and access
+Open http://localhost:3000/discover for the marketplace or http://localhost:3000 for the workspace. The workspace selector switches between personal access, the management portfolio, and individual properties. Selecting an experience never grants permissions.
 
-- **Administrator**: manages all listings, units, access groups, applications, residents, balances, and contact inquiries.
-- **Property owner**: sees only properties assigned through an owner group, their applicants, and their resident records.
-- **Resident**: sees their active lease, amount due, due date, open charges, and recorded payment history.
+Local development intentionally defaults to an administrator. Do not expose this development server to the internet. Hosted identity depends on trusted platform-injected authentication headers; external customer sign-in requires deployment-specific confirmation.
 
-The initial administrator is btuyisenge40@gmail.com. Administrators can create groups in the **Access** section, attach each group to a property, and grant access by email. New people receive their assigned access on first sign-in.
+## Working flows
 
-Creating a resident lease in **Residents** links that resident's email to their portal. Their first rent charge is visible as soon as they sign in with that same email address.
+- Public rent/sale listings, search filters, grid/list views, photos, units, saved homes, and recently viewed homes.
+- Guided applications with server-saved drafts, reusable profile data, account ownership, review stages, and internal/private timelines.
+- Approved application → pending lease → pending move-in tenancy → confirmed active resident, with notice and move-out transitions.
+- Resident balances, due dates, receipt history, household relationships, maintenance, private replies, and scoped documents.
+- Management action center, property scope selector, authorized portfolio search, and owner/investor performance views.
+- Team & Access with property-scoped invitations, explicit acceptance, role changes, revocation, and centralized permission checks.
+- Public contact inquiries stored for administrator review.
 
-## Payments
+Owners, staff, applicants and residents can be the same account at different properties. Groups are retained as legacy migration records, not the primary administration or authorization interface.
 
-The resident portal currently provides a durable balance and payment ledger. Management can use the payment endpoint to record received payments. Live card, mobile-money, or bank-transfer checkout requires a connected payment processor and its account credentials; it is intentionally not simulated as a real payment.
+## Financial and external integrations
 
-## Local development
+Payments currently record verified cash/transfer receipts; they do not move money. Screening is a manually tracked stage. No payment checkout, screening provider, electronic signature service, recurring billing scheduler, or paid-listing subscription is connected.
 
-    npm install
-    npm run dev -- --port 3000
+Contact inquiries are always stored. Email notifications to **btuyisenge40@gmail.com** require:
 
-The local server provides a development administrator account so the workspace can be exercised without a hosted sign-in session.
+```dotenv
+RESEND_API_KEY=...
+CONTACT_FROM_EMAIL="Urugo <hello@your-verified-domain.com>"
+```
 
-## Email notifications
+Use a verified sender. Without working provider configuration, do not claim email delivery. Team invitations are available in-app on sign-in; invitation email delivery is not implemented. Never commit secret keys.
 
-Every contact inquiry is stored in the workspace under **Inquiries**. To also receive each inquiry by email at btuyisenge40@gmail.com, configure these runtime secrets before deployment:
+## Data and migration
 
-    RESEND_API_KEY=...
-    CONTACT_FROM_EMAIL="Urugo <hello@your-verified-domain.com>"
+D1 stores records; R2 stores files. Additive migrations preserve existing IDs, groups, properties, applications and leases. Owner memberships become ownerships; actual leases produce tenancies and household members; resident groups alone do not create residency. Historical applications remain unclaimed until verified rather than trusting their typed email.
 
-CONTACT_FROM_EMAIL must be a sender verified with Resend. Without these values, the contact form still records every inquiry safely in the dashboard, but does not send an email notification.
+Generated migrations and local runtime backfill are included and tested. No remote database migration has been performed in this pass. Back up and rehearse against staging before production deployment.
 
 ## Validation
 
-    npm run build
-    npm test
+```sh
+npm run typecheck
+npm run lint
+npm run build
+npm test
+URUGO_TEST_URL=http://localhost:3000 npm test
+npm audit
+```
+
+Without `URUGO_TEST_URL`, only offline migration tests run and the integration suite is explicitly skipped. The local integration run uses synthetic accounts and disposable properties; it deletes only those properties afterward.
+
+The last full local run passed 14 tests. Typecheck, lint and build pass. The full dependency audit reported zero known vulnerabilities on October 2, 2026. This does not replace security review, provider configuration, staging migration rehearsal, or browser/mobile acceptance testing.

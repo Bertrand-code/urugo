@@ -1,70 +1,118 @@
-import { AccessError, currentAccount, database, errorResponse, isEmail, stringField } from "@/lib/data";
-
+import {
+  database,
+  requireAccount,
+  errorResponse,
+  AccessError,
+  stringField,
+} from "@/lib/data";
+import { managementScope } from "@/lib/authorization";
+import {
+  applicationFields,
+  applicationJoin,
+  profileData,
+} from "@/lib/applications";
 export const dynamic = "force-dynamic";
-
-type ApplicationRow = {
-  id: string;
-  property_id: string;
-  property_name: string;
-  full_name: string;
-  email: string;
-  phone: string;
-  move_in_date: string | null;
-  household_size: number;
-  message: string;
-  status: "new" | "reviewing" | "declined" | "accepted";
-  created_at: string;
-};
-
-export async function GET() {
+export async function GET(request: Request) {
   try {
-    const account = await currentAccount();
-    if (!account) throw new AccessError("Please sign in to review applications.", 401);
-    if (account.role === "resident") throw new AccessError("Applications are available to property owners and administrators.", 403);
+    const account = await requireAccount();
     const db = await database();
-    const query = account.role === "admin"
-      ? `SELECT a.id, a.property_id, p.name AS property_name, a.full_name, a.email, a.phone, a.move_in_date, a.household_size, a.message, a.status, a.created_at
-         FROM applications a INNER JOIN properties p ON p.id = a.property_id ORDER BY a.created_at DESC`
-      : `SELECT a.id, a.property_id, p.name AS property_name, a.full_name, a.email, a.phone, a.move_in_date, a.household_size, a.message, a.status, a.created_at
-         FROM applications a
-         INNER JOIN properties p ON p.id = a.property_id
-         INNER JOIN property_memberships pm ON pm.property_id = a.property_id
-         WHERE pm.account_id = ? AND pm.role = 'owner'
-         ORDER BY a.created_at DESC`;
-    const result = account.role === "admin"
-      ? await db.prepare(query).all<ApplicationRow>()
-      : await db.prepare(query).bind(account.id).all<ApplicationRow>();
-    return Response.json({ applications: result.results });
+    const personal =
+      new URL(request.url).searchParams.get("experience") === "personal";
+    const scope = personal
+      ? { sql: "w.account_id=?", values: [account.id] }
+      : await managementScope(account, "application.view", "a.property_id");
+    const rows = await db
+      .prepare(
+        "SELECT " +
+          applicationFields +
+          " FROM " +
+          applicationJoin +
+          " WHERE " +
+          scope.sql +
+          (personal ? "" : " AND w.stage!='draft'") +
+          " ORDER BY a.created_at DESC",
+      )
+      .bind(...scope.values)
+      .all();
+    return Response.json({ applications: rows.results });
   } catch (error) {
     return errorResponse(error);
   }
 }
-
 export async function POST(request: Request) {
   try {
-    const payload = await request.json() as Record<string, unknown>;
-    const propertyId = stringField(payload.propertyId, 100);
-    const fullName = stringField(payload.fullName, 100);
-    const email = stringField(payload.email, 150).toLowerCase();
-    const phone = stringField(payload.phone, 50);
-    const moveInDate = stringField(payload.moveInDate, 20) || null;
-    const householdSize = Number(payload.householdSize);
-    const message = stringField(payload.message, 2000);
-
-    if (!propertyId || !fullName || !isEmail(email) || !phone || !Number.isInteger(householdSize) || householdSize < 1 || householdSize > 30) {
-      return Response.json({ error: "Please complete your name, contact details, and household size." }, { status: 400 });
-    }
+    const account = await requireAccount();
+    const body = (await request.json()) as Record<string, unknown>;
     const db = await database();
-    const property = await db.prepare("SELECT id, name FROM properties WHERE id = ? AND status = 'published'").bind(propertyId).first<{ id: string; name: string }>();
-    if (!property) return Response.json({ error: "This listing is no longer accepting applications." }, { status: 404 });
-
-    const application = {
-      id: crypto.randomUUID(), property_id: property.id, property_name: property.name, full_name: fullName, email, phone,
-      move_in_date: moveInDate, household_size: householdSize, message, status: "new" as const, created_at: new Date().toISOString(),
-    };
-    await db.prepare("INSERT INTO applications (id, property_id, full_name, email, phone, move_in_date, household_size, message, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new')")
-      .bind(application.id, propertyId, fullName, email, phone, moveInDate, householdSize, message).run();
-    return Response.json({ application }, { status: 201 });
+    const propertyId = stringField(body.propertyId),
+      unitId = stringField(body.unitId) || null;
+    const property = await db
+      .prepare(
+        "SELECT id FROM properties WHERE id=? AND status='published' AND NOT EXISTS (SELECT 1 FROM listing_details d WHERE d.property_id=properties.id AND d.publication!='published')",
+      )
+      .bind(propertyId)
+      .first();
+    if (!property)
+      throw new AccessError("This listing is not accepting applications.", 404);
+    if (
+      unitId &&
+      !(await db
+        .prepare(
+          "SELECT id FROM units WHERE id=? AND property_id=? AND status='available'",
+        )
+        .bind(unitId, propertyId)
+        .first())
+    )
+      throw new AccessError("This unit is not available.", 400);
+    const existing = await db
+      .prepare(
+        "SELECT a.id FROM applications a JOIN application_workflows w ON w.application_id=a.id WHERE a.property_id=? AND w.account_id=? AND COALESCE(w.unit_id,'')=COALESCE(?,'') AND w.stage NOT IN ('denied','withdrawn')",
+      )
+      .bind(propertyId, account.id, unitId)
+      .first<{ id: string }>();
+    if (existing)
+      return Response.json({ application: existing }, { status: 200 });
+    const draft = body.draft !== false;
+    const fullName = stringField(body.fullName, 100) || account.display_name;
+    const phone = stringField(body.phone, 50);
+    const size = Number(body.householdSize) || 1;
+    if (!Number.isInteger(size) || size < 1 || size > 30 || (!draft && !phone))
+      throw new AccessError("Enter valid contact and household details.", 400);
+    const id = crypto.randomUUID();
+    const stage = draft ? "draft" : "submitted";
+    await db.batch([
+      db
+        .prepare(
+          "INSERT INTO applications (id,property_id,full_name,email,phone,household_size,move_in_date,message,status) VALUES (?,?,?,?,?,?,?,?,'new')",
+        )
+        .bind(
+          id,
+          propertyId,
+          fullName,
+          account.email,
+          phone,
+          size,
+          stringField(body.moveInDate) || null,
+          stringField(body.message, 2000),
+        ),
+      db
+        .prepare(
+          "INSERT INTO application_workflows (application_id,account_id,unit_id,stage,profile_snapshot) VALUES (?,?,?,?,?)",
+        )
+        .bind(
+          id,
+          account.id,
+          unitId,
+          stage,
+          JSON.stringify(profileData(body.profile)),
+        ),
+      db
+        .prepare(
+          "INSERT INTO application_events (id,application_id,actor_id,stage) VALUES (?,?,?,?)",
+        )
+        .bind(crypto.randomUUID(), id, account.id, stage),
+    ]);
+    return Response.json({ application: { id, stage } }, { status: 201 });
   } catch (error) {
     return errorResponse(error);
   }
